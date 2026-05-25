@@ -1,0 +1,75 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copy files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "app.py,requirements.txt"
+          target: /home/ubuntu/app
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.2.1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3-pip python3-venv nginx
+
+            # Setup virtualenv
+            python3 -m venv /home/ubuntu/app/venv
+            /home/ubuntu/app/venv/bin/pip install -r /home/ubuntu/app/requirements.txt
+
+            # Setup systemd service
+            sudo tee /etc/systemd/system/cicd-test.service > /dev/null << 'SVC'
+            [Unit]
+            Description=CICD Test App
+            After=network.target
+
+            [Service]
+            User=ubuntu
+            WorkingDirectory=/home/ubuntu/app
+            ExecStart=/home/ubuntu/app/venv/bin/gunicorn -w 2 -b 127.0.0.1:8000 app:app
+            Restart=always
+
+            [Install]
+            WantedBy=multi-user.target
+            SVC
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable cicd-test
+            sudo systemctl restart cicd-test
+
+            # Setup nginx reverse proxy
+            sudo tee /etc/nginx/sites-available/cicd-test > /dev/null << 'NGX'
+            server {
+                listen 80;
+                server_name _;
+
+                location / {
+                    proxy_pass http://127.0.0.1:8000;
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                }
+            }
+            NGX
+
+            sudo ln -sf /etc/nginx/sites-available/cicd-test /etc/nginx/sites-enabled/
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo nginx -t && sudo systemctl restart nginx
+
+            echo "Deploy done!"
